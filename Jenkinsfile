@@ -10,6 +10,7 @@
  * to run in both Kubernetes and OpenShift environments.
  */
 
+
 def buildAgentName(String jobNameWithNamespace, String buildNumber, String namespace) {
     def jobName = removeNamespaceFromJobName(jobNameWithNamespace, namespace);
 
@@ -46,26 +47,6 @@ kind: Pod
 spec:
   serviceAccountName: jenkins
   containers:
-    - name: jdk11
-      image: jenkins/slave:latest-jdk11
-      tty: true
-      command: ["/bin/bash"]
-      workingDir: ${workingDir}
-      envFrom:
-        - configMapRef:
-            name: pactbroker-config
-            optional: true
-        - configMapRef:
-            name: sonarqube-config
-            optional: true
-        - secretRef:
-            name: sonarqube-access
-            optional: true
-      env:
-        - name: HOME
-          value: ${workingDir}
-        - name: SONAR_USER_HOME
-          value: ${workingDir}
     - name: node
       image: node:12-stretch
       tty: true
@@ -122,9 +103,7 @@ spec:
         - name: HOME
           value: /home/devops
         - name: ENVIRONMENT_NAME
-          value: ${namespace}
-        - name: BUILD_NUMBER
-          value: ${env.BUILD_NUMBER}
+          value: ${env.NAMESPACE}
     - name: trigger-cd
       image: docker.io/garagecatalyst/ibmcloud-dev:1.0.8
       tty: true
@@ -140,16 +119,27 @@ spec:
 """
 ) {
     node(buildLabel) {
-        container(name: 'jdk11', shell: '/bin/bash') {
+        container(name: 'node', shell: '/bin/bash') {
             checkout scm
             stage('Build') {
-                sh '''
-                    ./gradlew assemble --no-daemon
+                sh '''#!/bin/bash
+                    npm install
+                    npm run build --if-present
                 '''
             }
             stage('Test') {
                 sh '''#!/bin/bash
-                    ./gradlew testClasses --no-daemon
+                    npm test
+                '''
+            }
+            stage('Publish pacts') {
+                sh '''#!/bin/bash
+                    npm run pact:publish --if-present
+                '''
+            }
+            stage('Verify pact') {
+                sh '''#!/bin/bash
+                    npm run pact:verify --if-present
                 '''
             }
             stage('Sonar scan') {
@@ -160,18 +150,9 @@ spec:
                   exit 0
                 fi
 
-                if [[ $(./gradlew tasks --all | grep -Eq "^sonarqube") ]]; then
-                    echo "SonarQube task found"
-                else
-                    echo "Skipping SonarQube step, no task defined"
-                    exit 0
-                fi
-
-                ./gradlew -Dsonar.login=${SONARQUBE_USER} -Dsonar.password=${SONARQUBE_PASSWORD} -Dsonar.host.url=${SONARQUBE_URL} sonarqube
+                npm run sonarqube:scan --if-present
                 '''
             }
-        }
-        container(name: 'node', shell: '/bin/bash') {
             stage('Tag release') {
                 sh '''#!/bin/bash
                     set -x
@@ -208,7 +189,10 @@ spec:
         container(name: 'ibmcloud', shell: '/bin/bash') {
             stage('Build image') {
                 sh '''#!/bin/bash
+
                     . ./env-config
+
+                    set +x
 
                     echo -e "=========================================================================================="
                     echo -e "BUILDING CONTAINER IMAGE: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
@@ -217,9 +201,11 @@ spec:
             }
             stage('Deploy to DEV env') {
                 sh '''#!/bin/bash
-                    . ./env-config
+                    echo "Deploying to ${ENVIRONMENT_NAME}"
 
                     set +x
+
+                    . ./env-config
 
                     if [[ "${CHART_NAME}" != "${IMAGE_NAME}" ]]; then
                       cp -R "${CHART_ROOT}/${CHART_NAME}" "${CHART_ROOT}/${IMAGE_NAME}"
@@ -236,7 +222,7 @@ spec:
 
                     echo "INITIALIZING helm with client-only (no Tiller)"
                     helm init --client-only 1> /dev/null 2> /dev/null
-                    
+
                     echo "CHECKING CHART (lint)"
                     helm lint ${CHART_PATH}
 
@@ -252,6 +238,8 @@ spec:
 
                     # Update helm chart with repository and tag values
                     cat ${CHART_PATH}/values.yaml | \
+                        yq w - nameOverride "${IMAGE_NAME}" | \
+                        yq w - fullnameOverride "${IMAGE_NAME}" | \
                         yq w - image.repository "${IMAGE_REPOSITORY}" | \
                         yq w - image.tag "${IMAGE_VERSION}" | \
                         yq w - ingress.enabled "${INGRESS_ENABLED}" | \
@@ -265,10 +253,10 @@ spec:
                         --namespace ${ENVIRONMENT_NAME} \
                         --set ingress.tlsSecretName="${TLS_SECRET_NAME}" \
                         --set ingress.subdomain="${INGRESS_SUBDOMAIN}" > ./release.yaml
-                    
+
                     echo -e "Generated release yaml for: ${CLUSTER_NAME}/${ENVIRONMENT_NAME}."
                     cat ./release.yaml
-                    
+
                     echo -e "Deploying into: ${CLUSTER_NAME}/${ENVIRONMENT_NAME}."
                     kubectl apply -n ${ENVIRONMENT_NAME} -f ./release.yaml --validate=false
                 '''
@@ -293,9 +281,8 @@ spec:
                         echo "====================================================================="
                     else
                         echo "Could not reach health endpoint: ${URL}/health"
-                        exit 1
-                    fi
-
+                        exit 1;
+                    fi;
                 '''
             }
             stage('Package Helm Chart') {
@@ -313,6 +300,7 @@ spec:
                     exit 1
                 fi
 
+                # Check if a Generic Local Repo has been created and retrieve the URL for it
                 export URL=$(curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD} -X GET "${ARTIFACTORY_URL}/artifactory/api/repositories?type=LOCAL" | jq '.[0].url' | tr -d \\")
                 echo ${URL}
 
